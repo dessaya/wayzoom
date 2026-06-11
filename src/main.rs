@@ -63,7 +63,28 @@ const BORDER_COLOR: u32 = 0xFF_FF3B30; // opaque red-orange
 const STEP: f32 = 1.15; // zoom multiplier per wheel notch
 const MAX_ZOOM: f32 = 8.0;
 
+/// Parse CLI args. Returns whether to draw the border. Exits on `--help`/unknown.
+fn parse_args() -> bool {
+    let mut border = true;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--no-border" => border = false,
+            "-h" | "--help" => {
+                println!("Usage: wayzoom [--no-border]\n\nA view-only screen magnifier.\n\nOptions:\n  --no-border   Don't draw the reminder border around the overlay.\n  -h, --help    Show this help.");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("wayzoom: unknown argument '{other}' (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+    border
+}
+
 fn main() {
+    let border = parse_args();
+
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland");
     let (globals, mut event_queue) = registry_queue_init(&conn).expect("registry init failed");
     let qh = event_queue.handle();
@@ -108,6 +129,7 @@ fn main() {
         keyboard: None,
         pointer: None,
 
+        border,
         exit: false,
         first_configure: true,
         logical_w: 0,
@@ -156,6 +178,7 @@ pub struct AppState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 
+    border: bool,
     pub exit: bool,
     first_configure: bool,
     logical_w: u32,
@@ -224,7 +247,9 @@ impl AppState {
         // The viewport maps a source crop of the frame to the full logical output.
         self.viewport.set_destination(self.logical_w as i32, self.logical_h as i32);
 
-        self.setup_border(qh);
+        if self.border {
+            self.setup_border(qh);
+        }
 
         if self.cursor == (0.0, 0.0) {
             self.cursor = (self.logical_w as f64 / 2.0, self.logical_h as f64 / 2.0);

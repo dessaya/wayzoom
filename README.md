@@ -23,8 +23,12 @@ While the overlay is up it grabs input — you can't interact with apps undernea
 ## Build & run
 
 ```sh
-cargo run --release
+cargo run --release            # or: cargo run --release -- --no-border
 ```
+
+Options:
+
+- `--no-border` — don't draw the reminder border around the overlay.
 
 Requires a compositor that supports `wlr-layer-shell`, `wlr-screencopy`, and
 `wp_viewporter` (most wlroots-based compositors and similar).
