@@ -2,6 +2,9 @@
 
 A small **view-only** screen magnifier for Wayland.
 
+Requires a compositor that supports `wlr-layer-shell`, `wlr-screencopy`, and
+`wp_viewporter` (most wlroots-based compositors and similar).
+
 It maps a fullscreen overlay with a colored border, grabs a single frozen frame of
 the current output via `wlr-screencopy`, and lets you pan/zoom it with the mouse.
 While the overlay is up it grabs input — you can't interact with apps underneath
@@ -29,11 +32,3 @@ cargo run --release            # or: cargo run --release -- --no-border
 Options:
 
 - `--no-border` — don't draw the reminder border around the overlay.
-
-Requires a compositor that supports `wlr-layer-shell`, `wlr-screencopy`, and
-`wp_viewporter` (most wlroots-based compositors and similar).
-
-## Notes / limitations
-
-- Assumes integer output scale.
-- The live hardware cursor floats unmagnified on top of the frozen view.
