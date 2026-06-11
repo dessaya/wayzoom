@@ -22,6 +22,9 @@ impl SourceImage {
 
 /// Render the magnified view into `dst` (`dst_w * dst_h * 4` bytes, `Argb8888`).
 ///
+/// Source pixels are bilinearly interpolated, so magnified content (especially
+/// text) looks smooth rather than blocky.
+///
 /// * `zoom` is clamped to `>= 1.0`; at `1.0` the whole source maps to the whole
 ///   destination (no panning).
 /// * `center` is the focus point in *source pixel* coordinates; the crop is
@@ -51,26 +54,41 @@ pub fn render(
 
     let sx_step = crop_w / dst_w as f32;
     let sy_step = crop_h / dst_h as f32;
-    let src_stride = src.stride();
-    let last_x = src.width.saturating_sub(1);
-    let last_y = src.height.saturating_sub(1);
 
     for dy in 0..dst_h {
-        let sy = ((y0 + dy as f32 * sy_step) as u32).min(last_y);
-        let src_row = sy as usize * src_stride;
+        let syf = y0 + dy as f32 * sy_step;
         let dst_row = dy as usize * dst_w as usize * 4;
         for dx in 0..dst_w {
-            let sx = ((x0 + dx as f32 * sx_step) as u32).min(last_x);
-            let si = src_row + sx as usize * 4;
+            let sxf = x0 + dx as f32 * sx_step;
             let di = dst_row + dx as usize * 4;
-            dst[di] = src.data[si];
-            dst[di + 1] = src.data[si + 1];
-            dst[di + 2] = src.data[si + 2];
-            dst[di + 3] = 0xFF; // force opaque (source may be XRGB)
+            sample_bilinear(src, sxf, syf, &mut dst[di..di + 4]);
         }
     }
 
     draw_border(dst, dst_w, dst_h, border_px, border_color);
+}
+
+/// Bilinearly sample the source at (`x`, `y`) source-pixel coordinates, writing
+/// `[B, G, R, A]` into `out` with a forced-opaque alpha.
+fn sample_bilinear(src: &SourceImage, x: f32, y: f32, out: &mut [u8]) {
+    let x = x.clamp(0.0, (src.width - 1) as f32);
+    let y = y.clamp(0.0, (src.height - 1) as f32);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(src.width - 1);
+    let y1 = (y0 + 1).min(src.height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let stride = src.stride();
+    let at = |px: u32, py: u32, c: usize| src.data[py as usize * stride + px as usize * 4 + c] as f32;
+
+    for (c, o) in out.iter_mut().enumerate().take(3) {
+        let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
+        let bot = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
+        *o = (top * (1.0 - fy) + bot * fy).round() as u8;
+    }
+    out[3] = 0xFF; // force opaque (source may be XRGB)
 }
 
 /// Overwrite the outer `border_px` ring of `dst` with `color` (0xAARRGGBB).
@@ -139,23 +157,28 @@ mod tests {
         let mut dst = vec![0u8; 4 * 4 * 4];
         // High zoom + center far outside bounds: must clamp, sample top-left pixel.
         render(&src, &mut dst, 4, 4, 8.0, (-100.0, -100.0), 0, 0);
-        // Every dst pixel should be source (0,0) = R channel 30.
+        // Crop is clamped into the top-left corner, so every pixel is a bilinear
+        // blend of the four source pixels (R channels 30..=33).
         for chunk in dst.chunks_exact(4) {
-            assert_eq!(chunk[2], 30);
+            assert!((30..=33).contains(&chunk[2]), "R={} out of range", chunk[2]);
         }
     }
 
     #[test]
-    fn upscales_2x() {
-        let src = src_2x2();
-        let mut dst = vec![0u8; 4 * 4 * 4];
-        // zoom 1 maps whole 2x2 source onto 4x4 dst -> each source pixel becomes 2x2.
-        render(&src, &mut dst, 4, 4, 1.0, (1.0, 1.0), 0, 0);
-        let r = |x: usize, y: usize| dst[(y * 4 + x) * 4 + 2];
-        assert_eq!(r(0, 0), 30);
-        assert_eq!(r(1, 0), 30);
-        assert_eq!(r(2, 0), 31);
-        assert_eq!(r(0, 2), 32);
-        assert_eq!(r(3, 3), 33);
+    fn bilinear_blends_between_pixels() {
+        // 2x1 source: R channel 0 on the left, 200 on the right.
+        let data = vec![
+            0, 0, 0, 0, // (0,0) R=0
+            0, 0, 200, 0, // (1,0) R=200
+        ];
+        let src = SourceImage { data, width: 2, height: 1 };
+        let mut dst = vec![0u8; 4 * 4];
+        // zoom 1, dst width 4: sample x positions 0.0, 0.5, 1.0, 1.5.
+        render(&src, &mut dst, 4, 1, 1.0, (0.0, 0.0), 0, 0);
+        let r = |x: usize| dst[x * 4 + 2];
+        assert_eq!(r(0), 0); // exact left pixel
+        assert_eq!(r(1), 100); // halfway -> mean(0, 200)
+        assert_eq!(r(2), 200); // exact right pixel
+        assert_eq!(r(3), 200); // clamped past the edge
     }
 }

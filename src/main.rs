@@ -48,7 +48,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-const BORDER_PX: u32 = 6;
+const BORDER_PX: u32 = 3;
 const BORDER_COLOR: u32 = 0xFF_FF3B30; // opaque red-orange
 const STEP: f32 = 1.15; // zoom multiplier per wheel notch
 const MAX_ZOOM: f32 = 8.0;
@@ -61,8 +61,9 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor unavailable");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unavailable");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm unavailable");
-    let screencopy_mgr: ZwlrScreencopyManagerV1 =
-        globals.bind(&qh, 1..=3, ()).expect("wlr-screencopy unavailable");
+    let screencopy_mgr: ZwlrScreencopyManagerV1 = globals
+        .bind(&qh, 1..=3, ())
+        .expect("wlr-screencopy unavailable");
 
     // Fullscreen overlay on the current output (None lets niri pick it).
     let surface = compositor.create_surface(&qh);
@@ -111,7 +112,9 @@ fn main() {
     };
 
     loop {
-        event_queue.blocking_dispatch(&mut state).expect("dispatch failed");
+        event_queue
+            .blocking_dispatch(&mut state)
+            .expect("dispatch failed");
         if state.exit {
             break;
         }
@@ -164,15 +167,21 @@ impl AppState {
             .expect("create transparent buffer");
         canvas.fill(0); // ARGB 0x00000000 — fully transparent
         let surface = self.layer.wl_surface();
-        buffer.attach_to(surface).expect("attach transparent buffer");
+        buffer
+            .attach_to(surface)
+            .expect("attach transparent buffer");
         self.layer.commit();
     }
 
     /// Called once the frozen frame is ready: derive the output scale, switch the
     /// surface to render at physical resolution, and draw the first magnified view.
     pub fn begin_magnify(&mut self, qh: &QueueHandle<Self>) {
-        let Some(src) = self.source.as_ref() else { return };
-        let scale = (src.width as f32 / self.logical_w.max(1) as f32).round().max(1.0) as i32;
+        let Some(src) = self.source.as_ref() else {
+            return;
+        };
+        let scale = (src.width as f32 / self.logical_w.max(1) as f32)
+            .round()
+            .max(1.0) as i32;
         self.scale = scale;
         self.dst_w = self.logical_w * scale as u32;
         self.dst_h = self.logical_h * scale as u32;
@@ -193,7 +202,9 @@ impl AppState {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let Some(src) = self.source.as_ref() else { return };
+        let Some(src) = self.source.as_ref() else {
+            return;
+        };
         let (dst_w, dst_h) = (self.dst_w, self.dst_h);
         if dst_w == 0 || dst_h == 0 {
             return;
@@ -207,7 +218,16 @@ impl AppState {
         // Map the cursor (surface-local logical coords) to source pixel coords.
         let cx = (self.cursor.0 as f32 / self.logical_w.max(1) as f32) * src.width as f32;
         let cy = (self.cursor.1 as f32 / self.logical_h.max(1) as f32) * src.height as f32;
-        render::render(src, canvas, dst_w, dst_h, self.zoom, (cx, cy), BORDER_PX, BORDER_COLOR);
+        render::render(
+            src,
+            canvas,
+            dst_w,
+            dst_h,
+            self.zoom,
+            (cx, cy),
+            BORDER_PX,
+            BORDER_COLOR,
+        );
 
         let surface = self.layer.wl_surface();
         surface.damage_buffer(0, 0, dst_w as i32, dst_h as i32);
