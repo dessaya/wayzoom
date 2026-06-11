@@ -1,0 +1,33 @@
+# Maintainer: Diego Essaya <diego.essaya@iota.org>
+#
+# Local build: from this directory run
+#     makepkg -si
+# to build the current working tree and install it with pacman.
+
+pkgname=wayzoom
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="View-only screen magnifier for Wayland"
+arch=('x86_64')
+url="https://github.com/dessaya/wayzoom"
+license=('MIT')
+depends=('libxkbcommon')
+makedepends=('cargo')
+
+build() {
+	cd "$startdir/.."
+	export CARGO_TARGET_DIR=target
+	cargo build --release --locked
+}
+
+check() {
+	cd "$startdir/.."
+	cargo test --release --locked
+}
+
+package() {
+	cd "$startdir/.."
+	install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+	install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+	install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

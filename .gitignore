@@ -4,3 +4,9 @@
 # Backup/temp files
 **/*.rs.bk
 *.pdb
+
+# makepkg artifacts
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.*
+/packaging/*.log

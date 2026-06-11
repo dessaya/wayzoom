@@ -1,4 +1,4 @@
-//! wayzoom — a view-only screen magnifier for Wayland (developed against niri).
+//! wayzoom — a view-only screen magnifier for Wayland.
 //!
 //! It maps a fullscreen `wlr-layer-shell` overlay with a colored border, grabs a
 //! single frozen frame of the current output via `wlr-screencopy`, and lets you
@@ -78,7 +78,7 @@ fn main() {
     let screencopy_mgr: ZwlrScreencopyManagerV1 =
         globals.bind(&qh, 1..=3, ()).expect("wlr-screencopy unavailable");
 
-    // Fullscreen overlay on the current output (None lets niri pick it).
+    // Fullscreen overlay on the current output (None lets the compositor pick it).
     let surface = compositor.create_surface(&qh);
     let layer =
         layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("wayzoom"), None);

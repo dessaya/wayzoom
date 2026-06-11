@@ -2,7 +2,7 @@
 name = "wayzoom"
 version = "0.1.0"
 edition = "2021"
-description = "View-only screen magnifier for Wayland (niri)"
+description = "View-only screen magnifier for Wayland"
 license = "MIT"
 
 [dependencies]
