@@ -11,8 +11,16 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
 
-use crate::render::SourceImage;
 use crate::AppState;
+
+/// A frozen captured frame. Always 4 bytes/pixel, top-down, row-major.
+///
+/// Byte order matches `wl_shm` `Argb8888` on little-endian: `[B, G, R, A]`.
+pub struct SourceImage {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// What the `buffer` event advertised for an shm-backed copy.
 #[derive(Clone, Copy)]

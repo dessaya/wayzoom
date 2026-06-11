@@ -7,17 +7,21 @@
 //!
 //! Why frozen: same-output live capture is impossible with wlr-screencopy (the
 //! overlay would capture itself → feedback). See the project plan for details.
+//!
+//! Scaling is offloaded to the compositor via `wp_viewporter`: the frozen frame is
+//! uploaded once, and each redraw merely moves the viewport source rectangle, so
+//! the compositor does the pan/scale/filtering on the GPU. The colored border
+//! lives on a static child subsurface (it must not be scaled with the content).
 
 mod capture;
-mod render;
+mod crop;
 
-use capture::CaptureFormat;
-use render::SourceImage;
+use capture::{CaptureFormat, SourceImage};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
+    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -37,12 +41,18 @@ use smithay_client_toolkit::{
         slot::{Buffer, SlotPool},
         Shm, ShmHandler,
     },
+    subcompositor::SubcompositorState,
 };
 use wayland_client::{
+    delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_compositor::WlCompositor, wl_keyboard, wl_output, wl_pointer, wl_region::WlRegion,
+        wl_seat, wl_shm, wl_subsurface::WlSubsurface, wl_surface,
+    },
     Connection, QueueHandle,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -61,9 +71,12 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor unavailable");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unavailable");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm unavailable");
-    let screencopy_mgr: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=3, ())
-        .expect("wlr-screencopy unavailable");
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .expect("wl_subcompositor unavailable");
+    let viewporter: WpViewporter =
+        globals.bind(&qh, 1..=1, ()).expect("wp_viewporter unavailable");
+    let screencopy_mgr: ZwlrScreencopyManagerV1 =
+        globals.bind(&qh, 1..=3, ()).expect("wlr-screencopy unavailable");
 
     // Fullscreen overlay on the current output (None lets niri pick it).
     let surface = compositor.create_surface(&qh);
@@ -76,6 +89,8 @@ fn main() {
     // Initial commit with no buffer; the compositor replies with a configure.
     layer.commit();
 
+    let viewport = viewporter.get_viewport(layer.wl_surface(), &qh, ());
+    let wl_compositor = compositor.wl_compositor().clone();
     let pool = SlotPool::new(1024, &shm).expect("failed to create shm pool");
 
     let mut state = AppState {
@@ -83,7 +98,10 @@ fn main() {
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
+        wl_compositor,
+        subcompositor,
         layer,
+        viewport,
         screencopy_mgr,
         pool,
 
@@ -94,9 +112,6 @@ fn main() {
         first_configure: true,
         logical_w: 0,
         logical_h: 0,
-        scale: 1,
-        dst_w: 0,
-        dst_h: 0,
         cursor: (0.0, 0.0),
         zoom: 1.0,
         dirty: false,
@@ -109,12 +124,17 @@ fn main() {
         capture_buffer: None,
         y_invert: false,
         source: None,
+
+        frame_w: 0,
+        frame_h: 0,
+        frame_buffer: None,
+        border_subsurface: None,
+        border_surface: None,
+        border_buffer: None,
     };
 
     loop {
-        event_queue
-            .blocking_dispatch(&mut state)
-            .expect("dispatch failed");
+        event_queue.blocking_dispatch(&mut state).expect("dispatch failed");
         if state.exit {
             break;
         }
@@ -126,7 +146,10 @@ pub struct AppState {
     seat_state: SeatState,
     output_state: OutputState,
     pub shm: Shm,
+    wl_compositor: WlCompositor,
+    subcompositor: SubcompositorState,
     layer: LayerSurface,
+    viewport: WpViewport,
     pub screencopy_mgr: ZwlrScreencopyManagerV1,
     pool: SlotPool,
 
@@ -137,9 +160,6 @@ pub struct AppState {
     first_configure: bool,
     logical_w: u32,
     logical_h: u32,
-    scale: i32,
-    dst_w: u32,
-    dst_h: u32,
     cursor: (f64, f64),
     zoom: f32,
     dirty: bool,
@@ -152,6 +172,16 @@ pub struct AppState {
     pub capture_buffer: Option<Buffer>,
     pub y_invert: bool,
     pub source: Option<SourceImage>,
+
+    // The frozen frame, uploaded once and kept attached to the layer surface.
+    frame_w: u32,
+    frame_h: u32,
+    frame_buffer: Option<Buffer>,
+
+    // Static border, kept alive for the lifetime of the overlay.
+    border_subsurface: Option<WlSubsurface>,
+    border_surface: Option<wl_surface::WlSurface>,
+    border_buffer: Option<Buffer>,
 }
 
 impl AppState {
@@ -167,25 +197,35 @@ impl AppState {
             .expect("create transparent buffer");
         canvas.fill(0); // ARGB 0x00000000 — fully transparent
         let surface = self.layer.wl_surface();
-        buffer
-            .attach_to(surface)
-            .expect("attach transparent buffer");
+        buffer.attach_to(surface).expect("attach transparent buffer");
         self.layer.commit();
     }
 
-    /// Called once the frozen frame is ready: derive the output scale, switch the
-    /// surface to render at physical resolution, and draw the first magnified view.
+    /// Called once the frozen frame is ready: upload it as a single buffer, switch
+    /// the surface to a viewport, attach the border, and present the first view.
     pub fn begin_magnify(&mut self, qh: &QueueHandle<Self>) {
-        let Some(src) = self.source.as_ref() else {
-            return;
-        };
-        let scale = (src.width as f32 / self.logical_w.max(1) as f32)
-            .round()
-            .max(1.0) as i32;
-        self.scale = scale;
-        self.dst_w = self.logical_w * scale as u32;
-        self.dst_h = self.logical_h * scale as u32;
-        self.layer.wl_surface().set_buffer_scale(scale);
+        let Some(src) = self.source.take() else { return };
+
+        // Upload the frozen frame once. Force alpha opaque (source may be XRGB).
+        let stride = src.width as i32 * 4;
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(src.width as i32, src.height as i32, stride, wl_shm::Format::Argb8888)
+            .expect("create frame buffer");
+        canvas.copy_from_slice(&src.data);
+        for px in canvas.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+        buffer.attach_to(self.layer.wl_surface()).expect("attach frame buffer");
+        self.frame_w = src.width;
+        self.frame_h = src.height;
+        self.frame_buffer = Some(buffer);
+
+        // The viewport maps a source crop of the frame to the full logical output.
+        self.viewport.set_destination(self.logical_w as i32, self.logical_h as i32);
+
+        self.setup_border(qh);
+
         if self.cursor == (0.0, 0.0) {
             self.cursor = (self.logical_w as f64 / 2.0, self.logical_h as f64 / 2.0);
         }
@@ -194,48 +234,83 @@ impl AppState {
         self.draw(qh);
     }
 
+    /// Build the static border as a child subsurface on top of the magnified view.
+    /// Its input region is empty so the pointer still reaches the parent.
+    fn setup_border(&mut self, qh: &QueueHandle<Self>) {
+        let (lw, lh) = (self.logical_w as i32, self.logical_h as i32);
+        let (subsurface, surface) =
+            self.subcompositor.create_subsurface(self.layer.wl_surface().clone(), qh);
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(lw, lh, lw * 4, wl_shm::Format::Argb8888)
+            .expect("create border buffer");
+        canvas.fill(0); // transparent center
+        draw_border_ring(canvas, self.logical_w, self.logical_h, BORDER_PX, BORDER_COLOR);
+
+        // Empty input region: pointer events fall through to the parent surface.
+        let region = self.wl_compositor.create_region(qh, ());
+        surface.set_input_region(Some(&region));
+
+        subsurface.set_position(0, 0);
+        subsurface.place_above(self.layer.wl_surface());
+        buffer.attach_to(&surface).expect("attach border buffer");
+        surface.damage_buffer(0, 0, lw, lh);
+        surface.commit(); // sync subsurface: applied on the next parent commit
+        region.destroy();
+
+        self.border_subsurface = Some(subsurface);
+        self.border_surface = Some(surface);
+        self.border_buffer = Some(buffer);
+    }
+
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
         self.dirty = true;
-        if self.source.is_some() && !self.frame_pending {
+        if self.frame_buffer.is_some() && !self.frame_pending {
             self.draw(qh);
         }
     }
 
+    /// Present a frame: move the viewport source rectangle and commit. No pixel
+    /// work — the compositor re-samples the already-attached buffer.
     fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let Some(src) = self.source.as_ref() else {
-            return;
-        };
-        let (dst_w, dst_h) = (self.dst_w, self.dst_h);
-        if dst_w == 0 || dst_h == 0 {
+        if self.frame_buffer.is_none() {
             return;
         }
-        let stride = dst_w as i32 * 4;
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(dst_w as i32, dst_h as i32, stride, wl_shm::Format::Argb8888)
-            .expect("create display buffer");
-
-        // Map the cursor (surface-local logical coords) to source pixel coords.
-        let cx = (self.cursor.0 as f32 / self.logical_w.max(1) as f32) * src.width as f32;
-        let cy = (self.cursor.1 as f32 / self.logical_h.max(1) as f32) * src.height as f32;
-        render::render(
-            src,
-            canvas,
-            dst_w,
-            dst_h,
+        let rect = crop::crop_source_rect(
+            self.frame_w,
+            self.frame_h,
+            self.logical_w,
+            self.logical_h,
+            self.cursor,
             self.zoom,
-            (cx, cy),
-            BORDER_PX,
-            BORDER_COLOR,
         );
+        self.viewport.set_source(rect.x, rect.y, rect.w, rect.h);
 
         let surface = self.layer.wl_surface();
-        surface.damage_buffer(0, 0, dst_w as i32, dst_h as i32);
+        surface.damage_buffer(0, 0, self.frame_w as i32, self.frame_h as i32);
         surface.frame(qh, surface.clone());
-        buffer.attach_to(surface).expect("attach display buffer");
         self.layer.commit();
         self.dirty = false;
         self.frame_pending = true;
+    }
+}
+
+/// Overwrite the outer `border_px` ring of an `Argb8888` canvas with `color`.
+fn draw_border_ring(canvas: &mut [u8], w: u32, h: u32, border_px: u32, color: u32) {
+    if border_px == 0 {
+        return;
+    }
+    let bw = border_px.min(w / 2).min(h / 2);
+    let bytes = color.to_le_bytes();
+    for y in 0..h {
+        let edge_row = y < bw || y >= h - bw;
+        for x in 0..w {
+            if edge_row || x < bw || x >= w - bw {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                canvas[i..i + 4].copy_from_slice(&bytes);
+            }
+        }
     }
 }
 
@@ -247,7 +322,7 @@ impl CompositorHandler for AppState {
         _: &wl_surface::WlSurface,
         _: i32,
     ) {
-        // Scale is derived from the captured frame dimensions instead.
+        // The viewport destination fixes the on-screen size regardless of scale.
     }
 
     fn transform_changed(
@@ -261,7 +336,7 @@ impl CompositorHandler for AppState {
 
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
         self.frame_pending = false;
-        if self.dirty && self.source.is_some() {
+        if self.dirty && self.frame_buffer.is_some() {
             self.draw(qh);
         }
     }
@@ -491,4 +566,9 @@ delegate_seat!(AppState);
 delegate_keyboard!(AppState);
 delegate_pointer!(AppState);
 delegate_layer!(AppState);
+delegate_subcompositor!(AppState);
 delegate_registry!(AppState);
+
+delegate_noop!(AppState: WpViewporter);
+delegate_noop!(AppState: WpViewport);
+delegate_noop!(AppState: WlRegion);
