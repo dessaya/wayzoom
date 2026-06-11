@@ -1,0 +1,14 @@
+[package]
+name = "wayzoom"
+version = "0.1.0"
+edition = "2021"
+description = "View-only screen magnifier for Wayland (niri)"
+license = "MIT"
+
+[dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[profile.release]
+opt-level = 3
