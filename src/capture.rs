@@ -65,7 +65,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                 height,
                 stride,
             } if is_supported(format) => {
-                state.cap_format = Some(CaptureFormat {
+                state.capture.format = Some(CaptureFormat {
                     format,
                     width,
                     height,
@@ -77,7 +77,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
             }
             Event::BufferDone => {
                 // All formats advertised; allocate an shm buffer and request the copy.
-                let Some(fmt) = state.cap_format else {
+                let Some(fmt) = state.capture.format else {
                     eprintln!("wayzoom: compositor offered no usable shm capture format");
                     state.exit = true;
                     return;
@@ -105,22 +105,24 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                     }
                 };
                 frame.copy(buffer.wl_buffer());
-                state.capture_pool = Some(pool);
-                state.capture_buffer = Some(buffer);
+                state.capture.pool = Some(pool);
+                state.capture.buffer = Some(buffer);
             }
             Event::Flags {
                 flags: WEnum::Value(flags),
             } => {
-                state.y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
+                state.capture.y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
             }
             Event::Ready { .. } => {
-                let Some(fmt) = state.cap_format else { return };
-                let mut pool = state.capture_pool.take();
-                let buffer = state.capture_buffer.take();
+                let Some(fmt) = state.capture.format else {
+                    return;
+                };
+                let mut pool = state.capture.pool.take();
+                let buffer = state.capture.buffer.take();
                 if let (Some(pool), Some(buffer)) = (pool.as_mut(), buffer.as_ref()) {
                     if let Some(canvas) = buffer.canvas(pool) {
-                        let src = normalize(canvas, fmt, state.y_invert);
-                        state.source = Some(src);
+                        let src = normalize(canvas, fmt, state.capture.y_invert);
+                        state.capture.source = Some(src);
                         frame.destroy();
                         state.begin_magnify(qh);
                         return;

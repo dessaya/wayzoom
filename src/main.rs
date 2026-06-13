@@ -139,24 +139,27 @@ fn main() {
             keyboard: None,
             pointer: None,
             size: None,
+            cursor: None,
+        },
+        render: RenderState {
+            last_frame_time: None,
+            dirty: false,
+            frame_pending: false,
+        },
+        capture: CaptureState {
+            started: false,
+            frame: None,
+            format: None,
+            pool: None,
+            buffer: None,
+            y_invert: false,
+            source: None,
         },
 
         border,
         exit: false,
-        cursor: (0.0, 0.0),
         zoom: 1.0,
         zoom_target: 1.0,
-        last_frame_time: None,
-        dirty: false,
-        frame_pending: false,
-
-        capture_started: false,
-        capture_frame: None,
-        cap_format: None,
-        capture_pool: None,
-        capture_buffer: None,
-        y_invert: false,
-        source: None,
 
         frame_w: 0,
         frame_h: 0,
@@ -190,27 +193,34 @@ pub struct WaylandState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     size: Option<(u32, u32)>,
+    cursor: Option<(f64, f64)>,
+}
+
+pub struct RenderState {
+    last_frame_time: Option<u32>,
+    dirty: bool,
+    frame_pending: bool,
+}
+
+pub struct CaptureState {
+    started: bool,
+    frame: Option<ZwlrScreencopyFrameV1>,
+    pub format: Option<CaptureFormat>,
+    pub pool: Option<SlotPool>,
+    pub buffer: Option<Buffer>,
+    pub y_invert: bool,
+    pub source: Option<SourceImage>,
 }
 
 pub struct AppState {
     wayland: WaylandState,
+    render: RenderState,
+    capture: CaptureState,
 
     border: bool,
     pub exit: bool,
-    cursor: (f64, f64),
     zoom: f32,
     zoom_target: f32,
-    last_frame_time: Option<u32>,
-    dirty: bool,
-    frame_pending: bool,
-
-    capture_started: bool,
-    capture_frame: Option<ZwlrScreencopyFrameV1>,
-    pub cap_format: Option<CaptureFormat>,
-    pub capture_pool: Option<SlotPool>,
-    pub capture_buffer: Option<Buffer>,
-    pub y_invert: bool,
-    pub source: Option<SourceImage>,
 
     // The frozen frame, uploaded once and kept attached to the layer surface.
     frame_w: u32,
@@ -248,7 +258,7 @@ impl AppState {
             return;
         };
 
-        let Some(src) = self.source.take() else {
+        let Some(src) = self.capture.source.take() else {
             return;
         };
 
@@ -282,11 +292,11 @@ impl AppState {
             self.setup_border(qh, w, h);
         }
 
-        if self.cursor == (0.0, 0.0) {
-            self.cursor = (w as f64 / 2.0, h as f64 / 2.0);
+        if self.wayland.cursor.is_none() {
+            self.wayland.cursor = Some((w as f64 / 2.0, h as f64 / 2.0));
         }
-        self.frame_pending = false;
-        self.dirty = true;
+        self.render.frame_pending = false;
+        self.render.dirty = true;
         self.draw(qh);
     }
 
@@ -324,9 +334,9 @@ impl AppState {
     }
 
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
-        self.dirty = true;
-        if self.frame_buffer.is_some() && !self.frame_pending {
-            self.last_frame_time = None; // restart the animation clock from idle
+        self.render.dirty = true;
+        if self.frame_buffer.is_some() && !self.render.frame_pending {
+            self.render.last_frame_time = None; // restart the animation clock from idle
             self.draw(qh);
         }
     }
@@ -334,12 +344,12 @@ impl AppState {
     /// Advance the displayed zoom toward the target with a time-based ease-out.
     /// Returns `true` while still animating (so the frame loop keeps going).
     fn step_zoom(&mut self, time: u32) -> bool {
-        let dt = match self.last_frame_time {
+        let dt = match self.render.last_frame_time {
             // Cap dt so an idle gap can't make the first step jump to the target.
             Some(prev) => (time.wrapping_sub(prev) as f32).min(64.0),
             None => 16.0,
         };
-        self.last_frame_time = Some(time);
+        self.render.last_frame_time = Some(time);
 
         let diff = self.zoom_target - self.zoom;
         if diff.abs() < 0.003 {
@@ -356,10 +366,13 @@ impl AppState {
         let Some((w, h)) = self.wayland.size else {
             return;
         };
+        let Some(cursor) = self.wayland.cursor else {
+            return;
+        };
         if self.frame_buffer.is_none() {
             return;
         }
-        let rect = crop::crop_source_rect(self.frame_w, self.frame_h, w, h, self.cursor, self.zoom);
+        let rect = crop::crop_source_rect(self.frame_w, self.frame_h, w, h, cursor, self.zoom);
         self.wayland
             .viewport
             .set_source(rect.x, rect.y, rect.w, rect.h);
@@ -368,8 +381,8 @@ impl AppState {
         surface.damage_buffer(0, 0, self.frame_w as i32, self.frame_h as i32);
         surface.frame(qh, surface.clone());
         self.wayland.layer.commit();
-        self.dirty = false;
-        self.frame_pending = true;
+        self.render.dirty = false;
+        self.render.frame_pending = true;
     }
 }
 
@@ -418,9 +431,9 @@ impl CompositorHandler for AppState {
         _: &wl_surface::WlSurface,
         time: u32,
     ) {
-        self.frame_pending = false;
+        self.render.frame_pending = false;
         let animating = self.step_zoom(time);
-        if (animating || self.dirty) && self.frame_buffer.is_some() {
+        if (animating || self.render.dirty) && self.frame_buffer.is_some() {
             self.draw(qh);
         }
     }
@@ -433,13 +446,13 @@ impl CompositorHandler for AppState {
         output: &wl_output::WlOutput,
     ) {
         // First time our (transparent) overlay lands on an output: capture it.
-        if !self.capture_started {
-            self.capture_started = true;
+        if !self.capture.started {
+            self.capture.started = true;
             let frame = self
                 .wayland
                 .screencopy_mgr
                 .capture_output(0, output, qh, ());
-            self.capture_frame = Some(frame);
+            self.capture.frame = Some(frame);
         }
     }
 
@@ -595,7 +608,7 @@ impl PointerHandler for AppState {
             }
             match event.kind {
                 Enter { .. } | Motion { .. } => {
-                    self.cursor = event.position;
+                    self.wayland.cursor = Some(event.position);
                     changed = true;
                 }
                 Axis { vertical, .. } => {
