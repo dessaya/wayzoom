@@ -59,10 +59,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
     ) {
         use zwlr_screencopy_frame_v1::Event;
         match event {
-            Event::Buffer { format: WEnum::Value(format), width, height, stride }
-                if is_supported(format) =>
-            {
-                state.cap_format = Some(CaptureFormat { format, width, height, stride });
+            Event::Buffer {
+                format: WEnum::Value(format),
+                width,
+                height,
+                stride,
+            } if is_supported(format) => {
+                state.cap_format = Some(CaptureFormat {
+                    format,
+                    width,
+                    height,
+                    stride,
+                });
             }
             Event::LinuxDmabuf { .. } | Event::Damage { .. } => {
                 // We only use the shm path; dmabuf is ignored.
@@ -75,7 +83,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                     return;
                 };
                 let pool_size = (fmt.stride * fmt.height) as usize;
-                let mut pool = match SlotPool::new(pool_size.max(1), &state.shm) {
+                let mut pool = match SlotPool::new(pool_size.max(1), &state.wayland.shm) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("wayzoom: failed to create capture pool: {e}");
@@ -100,7 +108,9 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                 state.capture_pool = Some(pool);
                 state.capture_buffer = Some(buffer);
             }
-            Event::Flags { flags: WEnum::Value(flags) } => {
+            Event::Flags {
+                flags: WEnum::Value(flags),
+            } => {
                 state.y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
             }
             Event::Ready { .. } => {
@@ -142,5 +152,9 @@ fn normalize(canvas: &[u8], fmt: CaptureFormat, y_invert: bool) -> SourceImage {
         let d = row * row_bytes;
         data[d..d + row_bytes].copy_from_slice(&canvas[s..s + row_bytes]);
     }
-    SourceImage { data, width: fmt.width, height: fmt.height }
+    SourceImage {
+        data,
+        width: fmt.width,
+        height: fmt.height,
+    }
 }

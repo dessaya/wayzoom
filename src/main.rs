@@ -52,29 +52,37 @@ use wayland_client::{
     },
     Connection, QueueHandle,
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
 const BORDER_PX: u32 = 3;
-const BORDER_COLOR: u32 = 0xFF_FF3B30; // opaque red-orange
-const STEP: f32 = 1.15; // zoom multiplier per wheel notch
-const MAX_ZOOM: f32 = 8.0;
+const BORDER_COLOR: u32 = 0xFF_FF3B30;
+
+const ZOOM_STEP: f32 = 1.15;
+const ZOOM_MAX: f32 = 8.0;
+/// exponential ease-out time constant for zoom (ms)
+const ZOOM_TAU_MS: f32 = 120.0;
 
 /// Parse CLI args. Returns whether to draw the border. Exits on `--help`/unknown.
 fn parse_args() -> bool {
+    let mut args = std::env::args();
+    let name = args.next().expect("missing argv[0]");
+
     let mut border = true;
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "--no-border" => border = false,
             "-h" | "--help" => {
-                println!("Usage: wayzoom [--no-border]\n\nA view-only screen magnifier.\n\nOptions:\n  --no-border   Don't draw the reminder border around the overlay.\n  -h, --help    Show this help.");
+                println!("Usage: {name} [--no-border]\n\nA view-only screen magnifier.\n\nOptions:\n  --no-border   Don't draw the reminder border around the overlay.\n  -h, --help    Show this help.");
                 std::process::exit(0);
             }
             other => {
-                eprintln!("wayzoom: unknown argument '{other}' (try --help)");
+                eprintln!("{name}: unknown argument '{other}' (try --help)");
                 std::process::exit(2);
             }
         }
@@ -94,10 +102,12 @@ fn main() {
     let shm = Shm::bind(&globals, &qh).expect("wl_shm unavailable");
     let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
         .expect("wl_subcompositor unavailable");
-    let viewporter: WpViewporter =
-        globals.bind(&qh, 1..=1, ()).expect("wp_viewporter unavailable");
-    let screencopy_mgr: ZwlrScreencopyManagerV1 =
-        globals.bind(&qh, 1..=3, ()).expect("wlr-screencopy unavailable");
+    let viewporter: WpViewporter = globals
+        .bind(&qh, 1..=1, ())
+        .expect("wp_viewporter unavailable");
+    let screencopy_mgr: ZwlrScreencopyManagerV1 = globals
+        .bind(&qh, 1..=3, ())
+        .expect("wlr-screencopy unavailable");
 
     // Fullscreen overlay on the current output (None lets the compositor pick it).
     let surface = compositor.create_surface(&qh);
@@ -111,23 +121,24 @@ fn main() {
     layer.commit();
 
     let viewport = viewporter.get_viewport(layer.wl_surface(), &qh, ());
-    let wl_compositor = compositor.wl_compositor().clone();
+    let compositor = compositor.wl_compositor().clone();
     let pool = SlotPool::new(1024, &shm).expect("failed to create shm pool");
 
     let mut state = AppState {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
-        shm,
-        wl_compositor,
-        subcompositor,
-        layer,
-        viewport,
-        screencopy_mgr,
-        pool,
-
-        keyboard: None,
-        pointer: None,
+        wayland: WaylandState {
+            registry: RegistryState::new(&globals),
+            seat: SeatState::new(&globals, &qh),
+            output: OutputState::new(&globals, &qh),
+            shm,
+            compositor,
+            subcompositor,
+            layer,
+            viewport,
+            screencopy_mgr,
+            pool,
+            keyboard: None,
+            pointer: None,
+        },
 
         border,
         exit: false,
@@ -136,6 +147,8 @@ fn main() {
         logical_h: 0,
         cursor: (0.0, 0.0),
         zoom: 1.0,
+        zoom_target: 1.0,
+        last_frame_time: None,
         dirty: false,
         frame_pending: false,
 
@@ -156,27 +169,32 @@ fn main() {
     };
 
     loop {
-        event_queue.blocking_dispatch(&mut state).expect("dispatch failed");
+        event_queue
+            .blocking_dispatch(&mut state)
+            .expect("dispatch failed");
         if state.exit {
             break;
         }
     }
 }
 
-pub struct AppState {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
+pub struct WaylandState {
+    registry: RegistryState,
+    seat: SeatState,
+    output: OutputState,
     pub shm: Shm,
-    wl_compositor: WlCompositor,
+    compositor: WlCompositor,
     subcompositor: SubcompositorState,
     layer: LayerSurface,
     viewport: WpViewport,
     pub screencopy_mgr: ZwlrScreencopyManagerV1,
     pool: SlotPool,
-
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+}
+
+pub struct AppState {
+    wayland: WaylandState,
 
     border: bool,
     pub exit: bool,
@@ -185,6 +203,8 @@ pub struct AppState {
     logical_h: u32,
     cursor: (f64, f64),
     zoom: f32,
+    zoom_target: f32,
+    last_frame_time: Option<u32>,
     dirty: bool,
     frame_pending: bool,
 
@@ -215,37 +235,52 @@ impl AppState {
         let h = self.logical_h.max(1);
         let stride = w as i32 * 4;
         let (buffer, canvas) = self
+            .wayland
             .pool
             .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
             .expect("create transparent buffer");
         canvas.fill(0); // ARGB 0x00000000 — fully transparent
-        let surface = self.layer.wl_surface();
-        buffer.attach_to(surface).expect("attach transparent buffer");
-        self.layer.commit();
+        let surface = self.wayland.layer.wl_surface();
+        buffer
+            .attach_to(surface)
+            .expect("attach transparent buffer");
+        self.wayland.layer.commit();
     }
 
     /// Called once the frozen frame is ready: upload it as a single buffer, switch
     /// the surface to a viewport, attach the border, and present the first view.
     pub fn begin_magnify(&mut self, qh: &QueueHandle<Self>) {
-        let Some(src) = self.source.take() else { return };
+        let Some(src) = self.source.take() else {
+            return;
+        };
 
         // Upload the frozen frame once. Force alpha opaque (source may be XRGB).
         let stride = src.width as i32 * 4;
         let (buffer, canvas) = self
+            .wayland
             .pool
-            .create_buffer(src.width as i32, src.height as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(
+                src.width as i32,
+                src.height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
             .expect("create frame buffer");
         canvas.copy_from_slice(&src.data);
         for px in canvas.chunks_exact_mut(4) {
             px[3] = 0xFF;
         }
-        buffer.attach_to(self.layer.wl_surface()).expect("attach frame buffer");
+        buffer
+            .attach_to(self.wayland.layer.wl_surface())
+            .expect("attach frame buffer");
         self.frame_w = src.width;
         self.frame_h = src.height;
         self.frame_buffer = Some(buffer);
 
         // The viewport maps a source crop of the frame to the full logical output.
-        self.viewport.set_destination(self.logical_w as i32, self.logical_h as i32);
+        self.wayland
+            .viewport
+            .set_destination(self.logical_w as i32, self.logical_h as i32);
 
         if self.border {
             self.setup_border(qh);
@@ -263,22 +298,31 @@ impl AppState {
     /// Its input region is empty so the pointer still reaches the parent.
     fn setup_border(&mut self, qh: &QueueHandle<Self>) {
         let (lw, lh) = (self.logical_w as i32, self.logical_h as i32);
-        let (subsurface, surface) =
-            self.subcompositor.create_subsurface(self.layer.wl_surface().clone(), qh);
+        let (subsurface, surface) = self
+            .wayland
+            .subcompositor
+            .create_subsurface(self.wayland.layer.wl_surface().clone(), qh);
 
         let (buffer, canvas) = self
+            .wayland
             .pool
             .create_buffer(lw, lh, lw * 4, wl_shm::Format::Argb8888)
             .expect("create border buffer");
         canvas.fill(0); // transparent center
-        draw_border_ring(canvas, self.logical_w, self.logical_h, BORDER_PX, BORDER_COLOR);
+        draw_border_ring(
+            canvas,
+            self.logical_w,
+            self.logical_h,
+            BORDER_PX,
+            BORDER_COLOR,
+        );
 
         // Empty input region: pointer events fall through to the parent surface.
-        let region = self.wl_compositor.create_region(qh, ());
+        let region = self.wayland.compositor.create_region(qh, ());
         surface.set_input_region(Some(&region));
 
         subsurface.set_position(0, 0);
-        subsurface.place_above(self.layer.wl_surface());
+        subsurface.place_above(self.wayland.layer.wl_surface());
         buffer.attach_to(&surface).expect("attach border buffer");
         surface.damage_buffer(0, 0, lw, lh);
         surface.commit(); // sync subsurface: applied on the next parent commit
@@ -292,8 +336,28 @@ impl AppState {
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
         self.dirty = true;
         if self.frame_buffer.is_some() && !self.frame_pending {
+            self.last_frame_time = None; // restart the animation clock from idle
             self.draw(qh);
         }
+    }
+
+    /// Advance the displayed zoom toward the target with a time-based ease-out.
+    /// Returns `true` while still animating (so the frame loop keeps going).
+    fn step_zoom(&mut self, time: u32) -> bool {
+        let dt = match self.last_frame_time {
+            // Cap dt so an idle gap can't make the first step jump to the target.
+            Some(prev) => (time.wrapping_sub(prev) as f32).min(64.0),
+            None => 16.0,
+        };
+        self.last_frame_time = Some(time);
+
+        let diff = self.zoom_target - self.zoom;
+        if diff.abs() < 0.003 {
+            self.zoom = self.zoom_target;
+            return false;
+        }
+        self.zoom += diff * (1.0 - (-dt / ZOOM_TAU_MS).exp());
+        true
     }
 
     /// Present a frame: move the viewport source rectangle and commit. No pixel
@@ -310,12 +374,14 @@ impl AppState {
             self.cursor,
             self.zoom,
         );
-        self.viewport.set_source(rect.x, rect.y, rect.w, rect.h);
+        self.wayland
+            .viewport
+            .set_source(rect.x, rect.y, rect.w, rect.h);
 
-        let surface = self.layer.wl_surface();
+        let surface = self.wayland.layer.wl_surface();
         surface.damage_buffer(0, 0, self.frame_w as i32, self.frame_h as i32);
         surface.frame(qh, surface.clone());
-        self.layer.commit();
+        self.wayland.layer.commit();
         self.dirty = false;
         self.frame_pending = true;
     }
@@ -359,9 +425,16 @@ impl CompositorHandler for AppState {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        time: u32,
+    ) {
         self.frame_pending = false;
-        if self.dirty && self.frame_buffer.is_some() {
+        let animating = self.step_zoom(time);
+        if (animating || self.dirty) && self.frame_buffer.is_some() {
             self.draw(qh);
         }
     }
@@ -376,7 +449,10 @@ impl CompositorHandler for AppState {
         // First time our (transparent) overlay lands on an output: capture it.
         if !self.capture_started {
             self.capture_started = true;
-            let frame = self.screencopy_mgr.capture_output(0, output, qh, ());
+            let frame = self
+                .wayland
+                .screencopy_mgr
+                .capture_output(0, output, qh, ());
             self.capture_frame = Some(frame);
         }
     }
@@ -422,7 +498,7 @@ impl LayerShellHandler for AppState {
 
 impl SeatHandler for AppState {
     fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
+        &mut self.wayland.seat
     }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -434,11 +510,11 @@ impl SeatHandler for AppState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+        if capability == Capability::Keyboard && self.wayland.keyboard.is_none() {
+            self.wayland.keyboard = self.wayland.seat.get_keyboard(qh, &seat, None).ok();
         }
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        if capability == Capability::Pointer && self.wayland.pointer.is_none() {
+            self.wayland.pointer = self.wayland.seat.get_pointer(qh, &seat).ok();
         }
     }
 
@@ -450,12 +526,12 @@ impl SeatHandler for AppState {
         capability: Capability,
     ) {
         if capability == Capability::Keyboard {
-            if let Some(kb) = self.keyboard.take() {
+            if let Some(kb) = self.wayland.keyboard.take() {
                 kb.release();
             }
         }
         if capability == Capability::Pointer {
-            if let Some(ptr) = self.pointer.take() {
+            if let Some(ptr) = self.wayland.pointer.take() {
                 ptr.release();
             }
         }
@@ -533,7 +609,7 @@ impl PointerHandler for AppState {
         use PointerEventKind::*;
         let mut changed = false;
         for event in events {
-            if &event.surface != self.layer.wl_surface() {
+            if &event.surface != self.wayland.layer.wl_surface() {
                 continue;
             }
             match event.kind {
@@ -549,7 +625,8 @@ impl PointerHandler for AppState {
                         (vertical.absolute / 15.0) as f32
                     };
                     if notches != 0.0 {
-                        self.zoom = (self.zoom * STEP.powf(-notches)).clamp(1.0, MAX_ZOOM);
+                        self.zoom_target =
+                            (self.zoom_target * ZOOM_STEP.powf(-notches)).clamp(1.0, ZOOM_MAX);
                         changed = true;
                     }
                 }
@@ -564,7 +641,7 @@ impl PointerHandler for AppState {
 
 impl OutputHandler for AppState {
     fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
+        &mut self.wayland.output
     }
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -573,13 +650,13 @@ impl OutputHandler for AppState {
 
 impl ShmHandler for AppState {
     fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
+        &mut self.wayland.shm
     }
 }
 
 impl ProvidesRegistryState for AppState {
     fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
+        &mut self.wayland.registry
     }
     registry_handlers![OutputState, SeatState];
 }
