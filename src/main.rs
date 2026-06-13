@@ -60,6 +60,8 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
+use crate::BorderState::Ready;
+
 const BORDER_PX: u32 = 3;
 const BORDER_COLOR: u32 = 0xFF_FF3B30;
 
@@ -125,6 +127,7 @@ fn main() {
     let pool = SlotPool::new(1024, &shm).expect("failed to create shm pool");
 
     let mut state = AppState {
+        exit: false,
         wayland: WaylandState {
             registry: RegistryState::new(&globals),
             seat: SeatState::new(&globals, &qh),
@@ -155,16 +158,14 @@ fn main() {
             y_invert: false,
             source: None,
         },
-
-        border,
-        exit: false,
         zoom: 1.0,
         zoom_target: 1.0,
-
         frame: None,
-        border_subsurface: None,
-        border_surface: None,
-        border_buffer: None,
+        border: if border {
+            BorderState::NotReady
+        } else {
+            BorderState::Disabled
+        },
     };
 
     loop {
@@ -215,23 +216,31 @@ pub struct FrameState {
     h: u32,
 }
 
+#[derive(PartialEq)]
+pub enum BorderState {
+    Disabled,
+    NotReady,
+    Ready {
+        subsurface: WlSubsurface,
+        surface: wl_surface::WlSurface,
+    },
+}
+
 pub struct AppState {
+    pub exit: bool,
+
     wayland: WaylandState,
     render: RenderState,
     capture: CaptureState,
 
-    border: bool,
-    pub exit: bool,
     zoom: f32,
     zoom_target: f32,
 
-    // The frozen frame, uploaded once and kept attached to the layer surface.
+    /// The frozen frame, uploaded once and kept attached to the layer surface.
     frame: Option<FrameState>,
 
-    // Static border, kept alive for the lifetime of the overlay.
-    border_subsurface: Option<WlSubsurface>,
-    border_surface: Option<wl_surface::WlSurface>,
-    border_buffer: Option<Buffer>,
+    /// Static border, kept alive for the lifetime of the overlay.
+    border: BorderState,
 }
 
 impl AppState {
@@ -290,7 +299,7 @@ impl AppState {
         // The viewport maps a source crop of the frame to the full logical output.
         self.wayland.viewport.set_destination(w as i32, h as i32);
 
-        if self.border {
+        if self.border == BorderState::NotReady {
             self.setup_border(qh, w, h);
         }
 
@@ -330,9 +339,10 @@ impl AppState {
         surface.commit(); // sync subsurface: applied on the next parent commit
         region.destroy();
 
-        self.border_subsurface = Some(subsurface);
-        self.border_surface = Some(surface);
-        self.border_buffer = Some(buffer);
+        self.border = Ready {
+            subsurface,
+            surface,
+        };
     }
 
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
