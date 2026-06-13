@@ -11,7 +11,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
 
-use crate::AppState;
+use crate::{AppState, Lifecycle};
 
 /// A frozen captured frame. Always 4 bytes/pixel, top-down, row-major.
 ///
@@ -79,7 +79,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                 // All formats advertised; allocate an shm buffer and request the copy.
                 let Some(fmt) = state.capture.format else {
                     eprintln!("wayzoom: compositor offered no usable shm capture format");
-                    state.exit = true;
+                    state.lifecycle = Lifecycle::Quitting;
                     return;
                 };
                 let pool_size = (fmt.stride * fmt.height) as usize;
@@ -87,7 +87,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("wayzoom: failed to create capture pool: {e}");
-                        state.exit = true;
+                        state.lifecycle = Lifecycle::Quitting;
                         return;
                     }
                 };
@@ -100,7 +100,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                     Ok((buffer, _canvas)) => buffer,
                     Err(e) => {
                         eprintln!("wayzoom: failed to create capture buffer: {e}");
-                        state.exit = true;
+                        state.lifecycle = Lifecycle::Quitting;
                         return;
                     }
                 };
@@ -129,11 +129,11 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
                     }
                 }
                 eprintln!("wayzoom: capture ready but buffer canvas was unavailable");
-                state.exit = true;
+                state.lifecycle = Lifecycle::Quitting;
             }
             Event::Failed => {
                 eprintln!("wayzoom: screencopy failed");
-                state.exit = true;
+                state.lifecycle = Lifecycle::Quitting;
             }
             _ => {}
         }

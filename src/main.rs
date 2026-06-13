@@ -127,7 +127,7 @@ fn main() {
     let pool = SlotPool::new(1024, &shm).expect("failed to create shm pool");
 
     let mut state = AppState {
-        exit: false,
+        lifecycle: Lifecycle::Running,
         wayland: WaylandState {
             registry: RegistryState::new(&globals),
             seat: SeatState::new(&globals, &qh),
@@ -172,7 +172,7 @@ fn main() {
         event_queue
             .blocking_dispatch(&mut state)
             .expect("dispatch failed");
-        if state.exit {
+        if state.lifecycle == Lifecycle::Quitting {
             break;
         }
     }
@@ -226,8 +226,17 @@ pub enum BorderState {
     },
 }
 
+/// App lifecycle. Esc moves Running → ZoomingOut (animate zoom to 1.0) → Quitting;
+/// fatal errors and a second Esc jump straight to Quitting.
+#[derive(PartialEq)]
+pub enum Lifecycle {
+    Running,
+    ZoomingOut,
+    Quitting,
+}
+
 pub struct AppState {
-    pub exit: bool,
+    pub lifecycle: Lifecycle,
 
     wayland: WaylandState,
     render: RenderState,
@@ -448,6 +457,9 @@ impl CompositorHandler for AppState {
         if animating || self.render.dirty {
             self.draw(qh);
         }
+        if !animating && self.lifecycle == Lifecycle::ZoomingOut {
+            self.lifecycle = Lifecycle::Quitting;
+        }
     }
 
     fn surface_enter(
@@ -480,7 +492,7 @@ impl CompositorHandler for AppState {
 
 impl LayerShellHandler for AppState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+        self.lifecycle = Lifecycle::Quitting;
     }
 
     fn configure(
@@ -572,13 +584,21 @@ impl KeyboardHandler for AppState {
     fn press_key(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         event: KeyEvent,
     ) {
         if event.keysym == Keysym::Escape {
-            self.exit = true;
+            if self.lifecycle == Lifecycle::ZoomingOut || self.zoom <= 1.0 + 0.003 {
+                // Already zoomed out (or a second Esc) — quit immediately.
+                self.lifecycle = Lifecycle::Quitting;
+            } else {
+                // Animate the zoom back to 1.0, then exit (see `frame`).
+                self.lifecycle = Lifecycle::ZoomingOut;
+                self.zoom_target = 1.0;
+                self.request_redraw(qh);
+            }
         }
     }
 
@@ -623,7 +643,7 @@ impl PointerHandler for AppState {
                     self.wayland.cursor = Some(event.position);
                     changed = true;
                 }
-                Axis { vertical, .. } => {
+                Axis { vertical, .. } if self.lifecycle == Lifecycle::Running => {
                     // Wheel up is negative; up should zoom in.
                     let notches = if vertical.discrete != 0 {
                         vertical.discrete as f32
