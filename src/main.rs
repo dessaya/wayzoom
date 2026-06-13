@@ -161,9 +161,7 @@ fn main() {
         zoom: 1.0,
         zoom_target: 1.0,
 
-        frame_w: 0,
-        frame_h: 0,
-        frame_buffer: None,
+        frame: None,
         border_subsurface: None,
         border_surface: None,
         border_buffer: None,
@@ -212,6 +210,11 @@ pub struct CaptureState {
     pub source: Option<SourceImage>,
 }
 
+pub struct FrameState {
+    w: u32,
+    h: u32,
+}
+
 pub struct AppState {
     wayland: WaylandState,
     render: RenderState,
@@ -223,9 +226,7 @@ pub struct AppState {
     zoom_target: f32,
 
     // The frozen frame, uploaded once and kept attached to the layer surface.
-    frame_w: u32,
-    frame_h: u32,
-    frame_buffer: Option<Buffer>,
+    frame: Option<FrameState>,
 
     // Static border, kept alive for the lifetime of the overlay.
     border_subsurface: Option<WlSubsurface>,
@@ -281,9 +282,10 @@ impl AppState {
         buffer
             .attach_to(self.wayland.layer.wl_surface())
             .expect("attach frame buffer");
-        self.frame_w = src.width;
-        self.frame_h = src.height;
-        self.frame_buffer = Some(buffer);
+        self.frame = Some(FrameState {
+            w: src.width,
+            h: src.height,
+        });
 
         // The viewport maps a source crop of the frame to the full logical output.
         self.wayland.viewport.set_destination(w as i32, h as i32);
@@ -335,7 +337,7 @@ impl AppState {
 
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
         self.render.dirty = true;
-        if self.frame_buffer.is_some() && !self.render.frame_pending {
+        if self.frame.is_some() && !self.render.frame_pending {
             self.render.last_frame_time = None; // restart the animation clock from idle
             self.draw(qh);
         }
@@ -369,16 +371,16 @@ impl AppState {
         let Some(cursor) = self.wayland.cursor else {
             return;
         };
-        if self.frame_buffer.is_none() {
+        let Some(frame) = self.frame.as_ref() else {
             return;
-        }
-        let rect = crop::crop_source_rect(self.frame_w, self.frame_h, w, h, cursor, self.zoom);
+        };
+        let rect = crop::crop_source_rect(frame.w, frame.h, w, h, cursor, self.zoom);
         self.wayland
             .viewport
             .set_source(rect.x, rect.y, rect.w, rect.h);
 
         let surface = self.wayland.layer.wl_surface();
-        surface.damage_buffer(0, 0, self.frame_w as i32, self.frame_h as i32);
+        surface.damage_buffer(0, 0, frame.w as i32, frame.h as i32);
         surface.frame(qh, surface.clone());
         self.wayland.layer.commit();
         self.render.dirty = false;
@@ -433,7 +435,7 @@ impl CompositorHandler for AppState {
     ) {
         self.render.frame_pending = false;
         let animating = self.step_zoom(time);
-        if (animating || self.render.dirty) && self.frame_buffer.is_some() {
+        if animating || self.render.dirty {
             self.draw(qh);
         }
     }
