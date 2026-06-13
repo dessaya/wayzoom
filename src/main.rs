@@ -138,13 +138,11 @@ fn main() {
             pool,
             keyboard: None,
             pointer: None,
+            size: None,
         },
 
         border,
         exit: false,
-        first_configure: true,
-        logical_w: 0,
-        logical_h: 0,
         cursor: (0.0, 0.0),
         zoom: 1.0,
         zoom_target: 1.0,
@@ -191,6 +189,7 @@ pub struct WaylandState {
     pool: SlotPool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    size: Option<(u32, u32)>,
 }
 
 pub struct AppState {
@@ -198,9 +197,6 @@ pub struct AppState {
 
     border: bool,
     pub exit: bool,
-    first_configure: bool,
-    logical_w: u32,
-    logical_h: u32,
     cursor: (f64, f64),
     zoom: f32,
     zoom_target: f32,
@@ -230,9 +226,7 @@ pub struct AppState {
 impl AppState {
     /// Map the surface with a fully transparent buffer so screencopy captures the
     /// real desktop beneath us (not our own overlay).
-    fn commit_transparent(&mut self) {
-        let w = self.logical_w.max(1);
-        let h = self.logical_h.max(1);
+    fn commit_transparent(&mut self, w: u32, h: u32) {
         let stride = w as i32 * 4;
         let (buffer, canvas) = self
             .wayland
@@ -250,6 +244,10 @@ impl AppState {
     /// Called once the frozen frame is ready: upload it as a single buffer, switch
     /// the surface to a viewport, attach the border, and present the first view.
     pub fn begin_magnify(&mut self, qh: &QueueHandle<Self>) {
+        let Some((w, h)) = self.wayland.size else {
+            return;
+        };
+
         let Some(src) = self.source.take() else {
             return;
         };
@@ -278,16 +276,14 @@ impl AppState {
         self.frame_buffer = Some(buffer);
 
         // The viewport maps a source crop of the frame to the full logical output.
-        self.wayland
-            .viewport
-            .set_destination(self.logical_w as i32, self.logical_h as i32);
+        self.wayland.viewport.set_destination(w as i32, h as i32);
 
         if self.border {
-            self.setup_border(qh);
+            self.setup_border(qh, w, h);
         }
 
         if self.cursor == (0.0, 0.0) {
-            self.cursor = (self.logical_w as f64 / 2.0, self.logical_h as f64 / 2.0);
+            self.cursor = (w as f64 / 2.0, h as f64 / 2.0);
         }
         self.frame_pending = false;
         self.dirty = true;
@@ -296,8 +292,8 @@ impl AppState {
 
     /// Build the static border as a child subsurface on top of the magnified view.
     /// Its input region is empty so the pointer still reaches the parent.
-    fn setup_border(&mut self, qh: &QueueHandle<Self>) {
-        let (lw, lh) = (self.logical_w as i32, self.logical_h as i32);
+    fn setup_border(&mut self, qh: &QueueHandle<Self>, w: u32, h: u32) {
+        let (lw, lh) = (w as i32, h as i32);
         let (subsurface, surface) = self
             .wayland
             .subcompositor
@@ -309,13 +305,7 @@ impl AppState {
             .create_buffer(lw, lh, lw * 4, wl_shm::Format::Argb8888)
             .expect("create border buffer");
         canvas.fill(0); // transparent center
-        draw_border_ring(
-            canvas,
-            self.logical_w,
-            self.logical_h,
-            BORDER_PX,
-            BORDER_COLOR,
-        );
+        draw_border_ring(canvas, w, h, BORDER_PX, BORDER_COLOR);
 
         // Empty input region: pointer events fall through to the parent surface.
         let region = self.wayland.compositor.create_region(qh, ());
@@ -363,17 +353,13 @@ impl AppState {
     /// Present a frame: move the viewport source rectangle and commit. No pixel
     /// work — the compositor re-samples the already-attached buffer.
     fn draw(&mut self, qh: &QueueHandle<Self>) {
+        let Some((w, h)) = self.wayland.size else {
+            return;
+        };
         if self.frame_buffer.is_none() {
             return;
         }
-        let rect = crop::crop_source_rect(
-            self.frame_w,
-            self.frame_h,
-            self.logical_w,
-            self.logical_h,
-            self.cursor,
-            self.zoom,
-        );
+        let rect = crop::crop_source_rect(self.frame_w, self.frame_h, w, h, self.cursor, self.zoom);
         self.wayland
             .viewport
             .set_source(rect.x, rect.y, rect.w, rect.h);
@@ -480,18 +466,13 @@ impl LayerShellHandler for AppState {
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if configure.new_size.0 != 0 && configure.new_size.1 != 0 {
-            self.logical_w = configure.new_size.0;
-            self.logical_h = configure.new_size.1;
-        }
-        if self.first_configure {
-            self.first_configure = false;
-            if self.logical_w == 0 || self.logical_h == 0 {
-                eprintln!("wayzoom: compositor gave a zero-size configure");
-                self.exit = true;
-                return;
+        let (w, h) = (configure.new_size.0, configure.new_size.1);
+        if w != 0 && h != 0 {
+            let first_configure = self.wayland.size.is_none();
+            self.wayland.size = Some((w, h));
+            if first_configure {
+                self.commit_transparent(w, h);
             }
-            self.commit_transparent();
         }
     }
 }
