@@ -32,3 +32,9 @@ cargo run --release            # or: cargo run --release -- --no-border
 Options:
 
 - `--no-border` — don't draw the reminder border around the overlay.
+
+## Toggling from a shortcut
+
+There is one instance per output. Launching wayzoom again for an output that
+already has one signals the running instance to exit (the same graceful zoom-out as
+`Esc`), so you can bind a single global shortcut to both open and close it.

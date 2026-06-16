@@ -10,6 +10,9 @@ smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = { version = "0.13", features = ["signals"] }
+calloop-wayland-source = "0.3"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

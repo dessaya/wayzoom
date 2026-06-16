@@ -16,8 +16,16 @@
 mod capture;
 mod crop;
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+
 use capture::{CaptureFormat, SourceImage};
 
+use calloop::signals::{Signal, Signals};
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
@@ -96,7 +104,7 @@ fn main() {
     let border = parse_args();
 
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland");
-    let (globals, mut event_queue) = registry_queue_init(&conn).expect("registry init failed");
+    let (globals, event_queue) = registry_queue_init(&conn).expect("registry init failed");
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor unavailable");
@@ -166,16 +174,35 @@ fn main() {
         } else {
             BorderState::Disabled
         },
+        lock: None,
     };
 
-    loop {
-        event_queue
-            .blocking_dispatch(&mut state)
-            .expect("dispatch failed");
-        if state.lifecycle == Lifecycle::Quitting {
-            break;
-        }
-    }
+    // calloop drives the Wayland queue alongside a SIGUSR1 source. Re-running the
+    // launch shortcut starts a second instance that signals this one (see
+    // `claim_output`), so SIGUSR1 must trigger the same graceful exit as Esc.
+    let mut event_loop: EventLoop<AppState> = EventLoop::try_new().expect("create event loop");
+    let handle = event_loop.handle();
+
+    WaylandSource::new(conn.clone(), event_queue)
+        .insert(handle.clone())
+        .expect("insert wayland source");
+
+    let signal_qh = qh.clone();
+    let signals = Signals::new(&[Signal::SIGUSR1]).expect("register SIGUSR1 handler");
+    handle
+        .insert_source(signals, move |_, _, state: &mut AppState| {
+            state.begin_exit(&signal_qh);
+        })
+        .expect("insert signal source");
+
+    let loop_signal = event_loop.get_signal();
+    event_loop
+        .run(None, &mut state, move |state| {
+            if state.lifecycle == Lifecycle::Quitting {
+                loop_signal.stop();
+            }
+        })
+        .expect("event loop error");
 }
 
 pub struct WaylandState {
@@ -250,6 +277,9 @@ pub struct AppState {
 
     /// Static border, kept alive for the lifetime of the overlay.
     border: BorderState,
+
+    /// Per-output single-instance lock; held (open) for the process lifetime.
+    lock: Option<File>,
 }
 
 impl AppState {
@@ -354,6 +384,22 @@ impl AppState {
         };
     }
 
+    /// Begin a graceful exit (shared by Esc and the SIGUSR1 from a second launch):
+    /// animate the zoom back to 1.0, then quit. Shortcuts straight to `Quitting`
+    /// when nothing is shown yet, already zoomed out, or already exiting.
+    fn begin_exit(&mut self, qh: &QueueHandle<Self>) {
+        if self.frame.is_none()
+            || self.lifecycle == Lifecycle::ZoomingOut
+            || self.zoom <= 1.0 + 0.003
+        {
+            self.lifecycle = Lifecycle::Quitting;
+        } else {
+            self.lifecycle = Lifecycle::ZoomingOut;
+            self.zoom_target = 1.0;
+            self.request_redraw(qh);
+        }
+    }
+
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
         self.render.dirty = true;
         if self.frame.is_some() && !self.render.frame_pending {
@@ -410,6 +456,58 @@ impl AppState {
         self.wayland.layer.commit();
         self.render.dirty = false;
         self.render.frame_pending = true;
+    }
+}
+
+enum Instance {
+    /// We acquired the lock; hold this open `File` for the process lifetime.
+    Primary(File),
+    /// Another live instance owns this output; it has been signalled to exit.
+    Secondary,
+}
+
+/// Per-output single-instance lock under `$XDG_RUNTIME_DIR`. The `flock` is
+/// released automatically when the holder's fd closes (including on crash), so a
+/// stale lock file can't wedge us. If another instance holds it, read its PID and
+/// send `SIGUSR1` (a graceful exit, same as Esc).
+fn claim_output(output_key: &str) -> Instance {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let safe: String = output_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("wayzoom-{safe}.lock"));
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false) // keep any existing PID so a secondary can read it
+        .open(&path)
+        .expect("open lock file");
+
+    // SAFETY: a plain flock on a valid fd.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if locked {
+        let _ = file.set_len(0);
+        let _ = write!(&file, "{}", std::process::id());
+        Instance::Primary(file)
+    } else {
+        let mut pid = String::new();
+        let _ = (&file).read_to_string(&mut pid);
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            // SAFETY: kill with a parsed PID; an invalid/dead PID is a harmless no-op.
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        }
+        Instance::Secondary
     }
 }
 
@@ -475,15 +573,32 @@ impl CompositorHandler for AppState {
         _: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        // First time our (transparent) overlay lands on an output: capture it.
-        if !self.capture.started {
-            self.capture.started = true;
-            let frame = self
-                .wayland
-                .screencopy_mgr
-                .capture_output(0, output, qh, ());
-            self.capture.frame = Some(frame);
+        if self.capture.started {
+            return;
         }
+        // First time our (transparent, still-invisible) overlay lands on an output.
+        self.capture.started = true;
+
+        // Single instance per output: if another instance already owns this output,
+        // signal it to exit and bail out before we capture or show anything.
+        let key = self
+            .wayland
+            .output
+            .info(output)
+            .and_then(|i| i.name)
+            .unwrap_or_else(|| "default".to_string());
+        match claim_output(&key) {
+            Instance::Primary(file) => self.lock = Some(file),
+            // We hold no lock and have shown nothing; the compositor frees our
+            // (transparent) surface when the connection closes on exit.
+            Instance::Secondary => std::process::exit(0),
+        }
+
+        let frame = self
+            .wayland
+            .screencopy_mgr
+            .capture_output(0, output, qh, ());
+        self.capture.frame = Some(frame);
     }
 
     fn surface_leave(
@@ -596,15 +711,7 @@ impl KeyboardHandler for AppState {
         event: KeyEvent,
     ) {
         if event.keysym == Keysym::Escape {
-            if self.lifecycle == Lifecycle::ZoomingOut || self.zoom <= 1.0 + 0.003 {
-                // Already zoomed out (or a second Esc) — quit immediately.
-                self.lifecycle = Lifecycle::Quitting;
-            } else {
-                // Animate the zoom back to 1.0, then exit (see `frame`).
-                self.lifecycle = Lifecycle::ZoomingOut;
-                self.zoom_target = 1.0;
-                self.request_redraw(qh);
-            }
+            self.begin_exit(qh);
         }
     }
 
