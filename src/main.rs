@@ -377,7 +377,13 @@ impl AppState {
             self.zoom = self.zoom_target;
             return false;
         }
-        self.zoom += diff * (1.0 - (-dt / ZOOM_TAU_MS).exp());
+        // The exit zoom-out runs at double speed (half the time constant).
+        let tau = if self.lifecycle == Lifecycle::ZoomingOut {
+            ZOOM_TAU_MS / 2.0
+        } else {
+            ZOOM_TAU_MS
+        };
+        self.zoom += diff * (1.0 - (-dt / tau).exp());
         true
     }
 
